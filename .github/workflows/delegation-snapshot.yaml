@@ -1,0 +1,33 @@
+name: Axelar Delegations Snapshot
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate-snapshot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Generate delegations snapshot
+        run: node index.js
+        env:
+          NODE_ENV: production
+
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Upload delegations artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegations-${{ steps.date.outputs.date }}
+          path: delegations.json
+          retention-days: 90
