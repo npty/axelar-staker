@@ -1,114 +1,133 @@
 const fs = require("fs");
 
-const axelarLcdEndpoint = "https://lcd-axelar.imperator.co";
-const axelarAllValidatorsEndpoint =
-  axelarLcdEndpoint + "/cosmos/staking/v1beta1/validators";
-const axelarDelegationsEndpoint = (delegatorAddress) =>
-  axelarLcdEndpoint +
-  `/cosmos/staking/v1beta1/validators/${delegatorAddress}/delegations`;
+const CONFIG = {
+  axelarLcdEndpoint: "https://lcd-axelar.imperator.co",
+  retryAttempts: 3,
+  retryDelay: 1000, // 1 second
+  outputFile: "delegations.json",
+};
+
+const API = {
+  validators: `${CONFIG.axelarLcdEndpoint}/cosmos/staking/v1beta1/validators`,
+  delegations: (delegatorAddress) =>
+    `${CONFIG.axelarLcdEndpoint}/cosmos/staking/v1beta1/validators/${delegatorAddress}/delegations`,
+};
+
+async function fetchWithRetry(url, attempts = CONFIG.retryAttempts) {
+  try {
+    const response = await fetch(url, {
+      headers: { Accept: "application/json" },
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    return await response.json();
+  } catch (error) {
+    if (attempts <= 1) throw error;
+
+    console.warn(
+      `Retrying fetch for ${url}. Attempts remaining: ${attempts - 1}`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, CONFIG.retryDelay));
+    return fetchWithRetry(url, attempts - 1);
+  }
+}
 
 function parseDelegation(delegation) {
   const { delegation: innerDelegation, balance } = delegation;
-  const amount = balance.amount;
-  const staker = innerDelegation.delegator_address;
-
   return {
-    staker: staker,
-    amount: amount,
+    staker: innerDelegation.delegator_address,
+    amount: balance.amount,
   };
 }
 
 function saveToFile(data) {
-  fs.writeFileSync("delegations.json", JSON.stringify(data, null, 2));
+  try {
+    fs.writeFileSync(CONFIG.outputFile, JSON.stringify(data, null, 2));
+    console.log(`Data successfully saved to ${CONFIG.outputFile}`);
+  } catch (error) {
+    console.error("Failed to save data to file:", error.message);
+    throw error;
+  }
 }
 
 async function getStakersByDelegatorAddresses(delegatorAddresses) {
   const allDelegations = [];
-  let totalQueries = 0;
 
-  for (const delegatorAddress of delegatorAddresses) {
-    let nextKey = true;
-    const queryParams = {};
+  for (const [index, delegatorAddress] of delegatorAddresses.entries()) {
+    let nextKey = null;
 
-    while (nextKey) {
-      if (nextKey && typeof nextKey === "string") {
-        queryParams["pagination.key"] = nextKey;
-      }
+    do {
+      const queryParams = new URLSearchParams({
+        ...(nextKey && { "pagination.key": nextKey }),
+      });
 
-      console.log(
-        axelarDelegationsEndpoint(delegatorAddress) +
-          new URLSearchParams(queryParams),
+      const delegationResult = await fetchWithRetry(
+        `${API.delegations(delegatorAddress)}?${queryParams}`,
       );
 
-      const delegationResponse = await fetch(
-        axelarDelegationsEndpoint(delegatorAddress) +
-          `?${new URLSearchParams(queryParams)}`,
-      );
-
-      const delegationResult = await delegationResponse.json();
-
-      nextKey = delegationResult.pagination?.next_key;
-
-      const delegations = delegationResult.delegation_responses;
-
-      const parsedDelegations = delegations.map(parseDelegation);
+      const parsedDelegations =
+        delegationResult.delegation_responses.map(parseDelegation);
 
       allDelegations.push(...parsedDelegations);
-    }
 
-    totalQueries++;
-
-    console.log(
-      `Fetched delegations ${totalQueries}/${delegatorAddresses.length}`,
-    );
+      nextKey = delegationResult.pagination?.next_key;
+      console.log(
+        `Progress: ${index + 1}/${delegatorAddresses.length} delegator addresses processed`,
+      );
+    } while (nextKey);
   }
 
   return allDelegations;
 }
 
 async function getDelegatorAddresses() {
-  let nextKey = true;
-  let allOperatorAddresses = [];
+  const allOperatorAddresses = [];
+  let nextKey = null;
 
-  while (nextKey) {
-    // Exclude the validators that are not bonded
-    const queryParams = {
+  do {
+    const queryParams = new URLSearchParams({
       status: "BOND_STATUS_BONDED",
-    };
+      ...(nextKey && { "pagination.key": nextKey }),
+    });
 
-    if (nextKey && typeof nextKey === "string") {
-      queryParams["pagination.key"] = nextKey;
-    }
-
-    const response = await fetch(
-      axelarAllValidatorsEndpoint + "?" + new URLSearchParams(queryParams),
+    const validatorResult = await fetchWithRetry(
+      `${API.validators}?${queryParams}`,
     );
-
-    const validatorResult = await response.json();
-
-    nextKey = validatorResult.pagination.next_key;
 
     const operatorAddresses = validatorResult.validators.map(
       (validator) => validator.operator_address,
     );
 
     allOperatorAddresses.push(...operatorAddresses);
-  }
+    nextKey = validatorResult.pagination.next_key;
+  } while (nextKey);
 
-  console.log("Total Operators: ", allOperatorAddresses.length);
-
+  console.log("Total Operators:", allOperatorAddresses.length);
   return allOperatorAddresses;
 }
 
 async function main() {
-  const delegatorAddresses = await getDelegatorAddresses();
-  const stakers = await getStakersByDelegatorAddresses(delegatorAddresses);
+  try {
+    console.log("Starting delegation snapshot process...");
 
-  saveToFile({
-    snapshotAt: new Date().toISOString(),
-    stakers: stakers,
-    total: stakers.length,
-  });
+    const delegatorAddresses = await getDelegatorAddresses();
+    const stakers = await getStakersByDelegatorAddresses(delegatorAddresses);
+
+    const result = {
+      snapshotAt: new Date().toISOString(),
+      stakers,
+      total: stakers.length,
+    };
+
+    saveToFile(result);
+    console.log("Snapshot process completed successfully!");
+  } catch (error) {
+    console.error("Failed to complete snapshot process:", error.message);
+    process.exit(1);
+  }
 }
 
 main();
